@@ -12,7 +12,6 @@ class DoubleConv(nn.Module):
             nn.GELU(approximate="tanh"),
             nn.Conv2d(out_channels, out_channels, 3, 1, 1, bias=False),
             nn.GELU(approximate="tanh"),
-            nn.ReLU(inplace=True),
         )
 
     def forward(self, x):
@@ -75,7 +74,7 @@ class UNET(nn.Module):
 
 
 if __name__ == "__main__":
-    x = torch.randn((3, 161, 161))
+    x = torch.randn((4, 3, 512, 512))  # Image should be (B, C, W, H)
     model = UNET(in_channels=3, out_channels=1)
     preds = model(x)
     print(x.shape)

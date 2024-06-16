@@ -1,6 +1,15 @@
+from dataclasses import dataclass, field
+
 import torch
 import torch.nn as nn
 import torchvision.transforms.functional as TF
+
+
+@dataclass
+class UnetConfig:
+    in_channels: int = 3
+    out_channels: int = 1
+    features: list[int] = field(default_factory=lambda: [64, 128, 256, 512])
 
 
 class DoubleConv(nn.Module):
@@ -19,23 +28,20 @@ class DoubleConv(nn.Module):
 
 
 class UNET(nn.Module):
-    def __init__(
-        self,
-        in_channels=3,
-        out_channels=1,
-        features=[64, 128, 256, 512],
-    ):
+    def __init__(self, UnetConfig):
         super(UNET, self).__init__()
         self.ups = nn.ModuleList()
         self.downs = nn.ModuleList()
         self.pool = nn.MaxPool2d(kernel_size=2, stride=2)
 
+        in_channels = UnetConfig.in_channels  # init the first channel
+
         # Down part
-        for feature in features:
+        for feature in UnetConfig.features:
             self.downs.append(DoubleConv(in_channels, feature))
             in_channels = feature
 
-        for feature in reversed(features):
+        for feature in reversed(UnetConfig.features):
             self.ups.append(
                 nn.ConvTranspose2d(
                     feature * 2,
@@ -46,8 +52,12 @@ class UNET(nn.Module):
             )
             self.ups.append(DoubleConv(feature * 2, feature))
 
-        self.bottleneck = DoubleConv(features[-1], features[-1] * 2)
-        self.final_conv = nn.Conv2d(features[0], out_channels, kernel_size=1)
+        self.bottleneck = DoubleConv(
+            UnetConfig.features[-1], UnetConfig.features[-1] * 2
+        )
+        self.final_conv = nn.Conv2d(
+            UnetConfig.features[0], UnetConfig.out_channels, kernel_size=1
+        )
 
     def forward(self, x):
         skip_connections = []
@@ -70,7 +80,9 @@ class UNET(nn.Module):
             concat_skip = torch.cat((skip_connection, x), dim=1)
             x = self.ups[idx + 1](concat_skip)
 
-        return self.final_conv(x)
+        logits = self.final_conv(x)
+        loss = None  # flattening out logits because cross entropy do not accept high dimensions
+        return logits
 
 
 if __name__ == "__main__":

@@ -1,12 +1,12 @@
 import cv2
 import numpy as np
+import torch
 import torchvision.transforms as transforms
 import torchvision.transforms.functional as TF
 from datasets import load_dataset
 from PIL import Image
 from torch.utils.data import DataLoader, Dataset, IterableDataset
 from torchvision.transforms.functional import pil_to_tensor
-import torch
 
 
 class PILImageProcessor:

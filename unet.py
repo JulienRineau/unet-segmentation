@@ -87,7 +87,7 @@ class UNET(nn.Module):
 
 if __name__ == "__main__":
     x = torch.randn((4, 3, 512, 512))  # Image should be (B, C, W, H)
-    model = UNET(in_channels=3, out_channels=1)
+    model = UNET(UnetConfig())
     preds = model(x)
     print(x.shape)
     print(preds.shape)

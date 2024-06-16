@@ -106,3 +106,4 @@ if __name__ == "__main__":
         cv2.imwrite(f"img{i}.png", cv2.cvtColor(seg_img, cv2.COLOR_RGB2BGR))
         if i == 10:
             break
+

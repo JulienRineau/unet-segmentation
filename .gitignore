@@ -1,2 +1,4 @@
 *.png
 *.ipynb
+wandb
+__pycache__

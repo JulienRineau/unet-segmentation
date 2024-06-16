@@ -35,14 +35,10 @@ class HuggingFacePILImageDataset(IterableDataset):
             for key, value in item.items():
                 if key == "image":
                     image = self.image_processor(value)
-                    image = np.transpose(
-                        image, (1, 2, 0)
-                    )  # Convert from (C, H, W) to (H, W, C)
                     image = image.cpu().numpy()
                 elif key == "annotation":
                     mask = self.annotation_processor(value)
                     mask = mask[1].cpu().numpy()
-                    mask = mask.reshape((512, 512, 1))
             yield image, mask
 
 
@@ -63,9 +59,6 @@ def create_segmentation_image(image, mask, alpha=0.2):
     if isinstance(mask, torch.Tensor):
         mask = mask.cpu().numpy()
 
-    if mask.shape[3] == 1:
-        mask = np.squeeze(mask, axis=3)  # Reduce (N, H, W, 1) to (N, H, W)
-
     # Check and adjust the image data type and scale
     if image.dtype == np.float32:
         # Assuming float32 image is in the range [0, 1]
@@ -81,10 +74,9 @@ def create_segmentation_image(image, mask, alpha=0.2):
     )  # Initialize full masks overlay
 
     for cls in unique_classes:
-        class_mask = (mask == cls)[
-            ..., None
-        ]  # Expand dimensions to (N, H, W, 1) for broadcasting
-        class_mask = np.squeeze(class_mask, axis=3)
+        class_mask = mask == cls
+        class_mask = mask[:, None, :, :]
+        class_mask = np.repeat(class_mask, 3, axis=1)
         if cls != 0:
             full_masks_overlay[class_mask] = class_to_color[cls]
         else:
@@ -100,24 +92,14 @@ def create_segmentation_image(image, mask, alpha=0.2):
 
 if __name__ == "__main__":
     train_dataset = load_dataset(
-        "scene_parse_150", "instance_segmentation", split="train", streaming=True
+        "scene_parse_150",
+        "instance_segmentation",
+        split="train",
+        streaming=True,
+        trust_remote_code=True,
     )
     train_dataset = HuggingFacePILImageDataset(train_dataset)
     train_dataloader = torch.utils.data.DataLoader(train_dataset, batch_size=4)
-
-    validation_dataset = load_dataset(
-        "scene_parse_150", "instance_segmentation", split="validation", streaming=True
-    )
-    validation_dataset = HuggingFacePILImageDataset(validation_dataset)
-    validation_dataloader = torch.utils.data.DataLoader(
-        validation_dataset, batch_size=4
-    )
-
-    test_dataset = load_dataset(
-        "scene_parse_150", "instance_segmentation", split="test", streaming=True
-    )
-    test_dataset = HuggingFacePILImageDataset(test_dataset)
-    test_dataloader = torch.utils.data.DataLoader(test_dataset, batch_size=4)
 
     for i, (image, mask) in enumerate(train_dataloader):
         seg_img, mask = create_segmentation_image(image, mask, 0.5)

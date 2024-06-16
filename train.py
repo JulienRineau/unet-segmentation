@@ -35,9 +35,9 @@ class UNETLightning(pl.LightningModule):
         loss = self._shared_step(batch)
         self.log("train_loss", loss)
 
-    def validation_step(self, batch, batch_idx):
-        loss = self._shared_step(batch)
-        self.log("val_loss", loss)
+    # def validation_step(self, batch, batch_idx):
+    #     loss = self._shared_step(batch)
+    #     self.log("val_loss", loss)
 
     def configure_optimizers(self):
         optimizer = torch.optim.AdamW(
@@ -64,24 +64,24 @@ class UNETLightning(pl.LightningModule):
         logging.info("Training DataLoader is ready.")
         return train_dataloader
 
-    def val_dataloader(self):
-        logging.info("Loading validation dataset...")
-        validation_dataset = load_dataset(
-            "scene_parse_150",
-            "instance_segmentation",
-            split="validation",
-            streaming=True,
-        )
-        logging.info(
-            "Validation dataset loaded. Wrapping with HuggingFacePILImageDataset..."
-        )
-        validation_dataset = HuggingFacePILImageDataset(validation_dataset)
-        validation_dataloader = torch.utils.data.DataLoader(
-            validation_dataset,
-            batch_size=4,
-        )
-        logging.info("Validation DataLoader is ready.")
-        return validation_dataloader
+    # def val_dataloader(self):
+    #     logging.info("Loading validation dataset...")
+    #     validation_dataset = load_dataset(
+    #         "scene_parse_150",
+    #         "instance_segmentation",
+    #         split="validation",
+    #         streaming=True,
+    #     )
+    #     logging.info(
+    #         "Validation dataset loaded. Wrapping with HuggingFacePILImageDataset..."
+    #     )
+    #     validation_dataset = HuggingFacePILImageDataset(validation_dataset)
+    #     validation_dataloader = torch.utils.data.DataLoader(
+    #         validation_dataset,
+    #         batch_size=4,
+    #     )
+    #     logging.info("Validation DataLoader is ready.")
+    #     return validation_dataloader
 
 
 if __name__ == "__main__":

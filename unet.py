@@ -81,13 +81,18 @@ class UNET(nn.Module):
             x = self.ups[idx + 1](concat_skip)  # DoubleConv operation
 
         logits = self.final_conv(x)
-        loss = None  # flattening out logits because cross entropy do not accept high dimensions
         return logits
 
 
 if __name__ == "__main__":
-    x = torch.randn((4, 3, 512, 512))  # Image should be (B, C, W, H)
-    model = UNET(UnetConfig())
-    preds = model(x)
-    print(x.shape)
-    print(preds.shape)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+
+    model = UNET(UnetConfig()).to(device)
+    x = torch.randn((4, 3, 512, 512)).to(device)  # Image should be (B, C, W, H)
+
+    with torch.no_grad():
+        preds = model(x)
+
+    print(f"Input shape: {x.shape}")
+    print(f"Output shape: {preds.shape}")

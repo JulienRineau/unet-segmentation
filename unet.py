@@ -57,7 +57,7 @@ class UNET(nn.Module):
         )
         self.final_conv = nn.Conv2d(
             UnetConfig.features[0], UnetConfig.out_channels, kernel_size=1
-        )
+        )  # weighted sum across all input channels for each spatial position
 
     def forward(self, x):
         skip_connections = []
@@ -68,17 +68,17 @@ class UNET(nn.Module):
             x = self.pool(x)
 
         x = self.bottleneck(x)
-        skip_connections = skip_connections[::-1]
+        skip_connections = skip_connections[::-1]  # take all elements, in reverse order
 
         for idx in range(0, len(self.ups), 2):
-            x = self.ups[idx](x)
+            x = self.ups[idx](x)  # transposed convolution (upsampling) operation.
             skip_connection = skip_connections[idx // 2]
 
             if x.shape != skip_connection.shape:
                 x = TF.resize(x, size=skip_connection.shape[2:])
 
             concat_skip = torch.cat((skip_connection, x), dim=1)
-            x = self.ups[idx + 1](concat_skip)
+            x = self.ups[idx + 1](concat_skip)  # DoubleConv operation
 
         logits = self.final_conv(x)
         loss = None  # flattening out logits because cross entropy do not accept high dimensions

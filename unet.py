@@ -8,7 +8,7 @@ import torchvision.transforms.functional as TF
 @dataclass
 class UnetConfig:
     in_channels: int = 3
-    out_channels: int = 1
+    out_channels: int = 150
     features: list[int] = field(default_factory=lambda: [64, 128, 256, 512])
 
 

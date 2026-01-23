@@ -1,170 +1,427 @@
-import json
 import os
+import random
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Optional
 
-import cv2
 import numpy as np
+import pytorch_lightning as pl
 import torch
 import torchvision.transforms as transforms
 import torchvision.transforms.functional as TF
 from datasets import load_dataset
 from PIL import Image
-from torch.utils.data import DataLoader, Dataset, IterableDataset
-from torchvision.transforms.functional import pil_to_tensor
+from torch.utils.data import DataLoader, Dataset
+
+ADE20K_IGNORE_INDEX = 255
 
 
-class HuggingFacePILImageDataset(Dataset):
-    def __init__(self, dataset, image_size=(512, 512)):
-        super(HuggingFacePILImageDataset, self).__init__()
-        self.dataset = dataset
-        self.image_size = image_size
-        self.image_transform = transforms.Compose(
-            [
-                transforms.Lambda(lambda img: img.convert("RGB")),
-                transforms.Resize(image_size),
-                transforms.Lambda(lambda img: pil_to_tensor(img)),
-                transforms.Lambda(lambda t: t.float() / 255.0),
-            ]
-        )
-        self.mask_transform = transforms.Compose(
-            [
-                transforms.Resize(image_size, interpolation=Image.NEAREST),
-                transforms.Lambda(lambda img: pil_to_tensor(img)),
-            ]
-        )
-
-    def __getitem__(self, index):
-        item = self.dataset[index]
-        image = self.image_transform(item["image"])
-        mask = self.mask_transform(item["annotation"])
-        # Ensure mask is a single-channel tensor
-        mask = mask[0] if mask.shape[0] > 1 else mask
-        return image, mask
-
-    def __len__(self):
-        return len(self.dataset)
+def map_ade20k_labels(mask: torch.Tensor, ignore_index: int = ADE20K_IGNORE_INDEX) -> torch.Tensor:
+    if mask.ndim == 3:
+        mask = mask[0]
+    mask = mask.to(torch.int64)
+    ignore = mask == 0
+    mask = mask - 1
+    mask[ignore] = ignore_index
+    return mask
 
 
-def custom_collate(batch):
-    images = [item[0] for item in batch]
-    masks = [item[1] for item in batch]
-
-    # Pad images and masks to the same size
-    max_h = max([img.shape[1] for img in images])
-    max_w = max([img.shape[2] for img in images])
-
-    padded_images = []
-    padded_masks = []
-
-    for img, mask in zip(images, masks):
-        p_img = torch.zeros((3, max_h, max_w), dtype=torch.float32)
-        p_mask = torch.zeros((1, max_h, max_w), dtype=torch.long)
-
-        p_img[:, : img.shape[1], : img.shape[2]] = img
-        p_mask[:, : mask.shape[0], : mask.shape[1]] = mask
-
-        padded_images.append(p_img)
-        padded_masks.append(p_mask)
-
-    return torch.stack(padded_images), torch.stack(padded_masks)
+def make_color_palette(num_classes: int, seed: int = 42) -> np.ndarray:
+    rng = np.random.default_rng(seed)
+    return rng.integers(0, 255, size=(num_classes, 3), dtype=np.uint8)
 
 
-def create_segmentation_image(image, mask, alpha=0.2):
-    """
-    Creates a batch of images with a semi-transparent segmentation mask overlay.
-    Args:
-    image (torch.Tensor): The original images, shape (N, C, H, W).
-    mask (torch.Tensor): The segmentation masks, shape (N, H, W) or (N, 1, H, W).
-    alpha (float): Transparency factor for the overlay (0 is fully transparent, 1 is opaque).
-    Returns:
-    tuple of numpy arrays: (The images with the segmentation mask overlays, Full mask overlays)
-    """
-    # Move tensors to CPU and convert to numpy
-    image = image.cpu().numpy()
-    mask = mask.cpu().numpy()
-
-    # Transpose image from (N, C, H, W) to (N, H, W, C)
-    image = np.transpose(image, (0, 2, 3, 1))
-
-    # Ensure mask is (N, H, W)
-    if mask.ndim == 4:
-        mask = np.squeeze(mask, axis=1)
-
-    # Check and adjust the image data type and scale
-    if image.dtype == np.float32:
-        # Assuming float32 image is in the range [0, 1]
-        image = np.clip(image * 255, 0, 255).astype(np.uint8)
-
-    unique_classes = np.unique(mask)
-    colors = np.random.randint(0, 255, (len(unique_classes), 3), dtype=np.uint8)
-    class_to_color = {cls: colors[i] for i, cls in enumerate(unique_classes)}
-
-    output_images = image.copy()  # Start with a copy of the original images
-    full_masks_overlay = np.zeros_like(
-        output_images, dtype=np.uint8
-    )  # Initialize full masks overlay
-
-    for cls in unique_classes:
-        class_mask = mask == cls
-        for i in range(image.shape[0]):  # Iterate over each image in the batch
-            full_masks_overlay[i][class_mask[i]] = class_to_color[cls]
-
-    # Blend overlay with the image using a custom alpha
-    for i in range(image.shape[0]):
-        cv2.addWeighted(
-            full_masks_overlay[i],
-            alpha,
-            output_images[i],
-            1 - alpha,
-            0,
-            output_images[i],
-        )
-
-    return output_images, full_masks_overlay
+def colorize_mask(
+    mask: torch.Tensor, palette: np.ndarray, ignore_index: int = ADE20K_IGNORE_INDEX
+) -> np.ndarray:
+    if isinstance(mask, torch.Tensor):
+        mask = mask.cpu().numpy()
+    if mask.ndim == 3:
+        mask = mask.squeeze(0)
+    h, w = mask.shape
+    output = np.zeros((h, w, 3), dtype=np.uint8)
+    valid = mask != ignore_index
+    output[valid] = palette[mask[valid]]
+    return output
 
 
-if __name__ == "__main__":
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
+@dataclass
+class ADE20KDataConfig:
+    image_size: int = 512
+    train_batch_size: int = 8
+    val_batch_size: int = 8
+    num_workers: int = 8
+    min_scale: float = 0.5
+    max_scale: float = 2.0
+    hflip_prob: float = 0.5
+    ignore_index: int = ADE20K_IGNORE_INDEX
+    data_root: Optional[str] = None
+    cache_dir: Optional[str] = None
+    train_subset: Optional[int] = None
+    val_subset: Optional[int] = None
+    test_subset: Optional[int] = None
+    trust_remote_code: bool = False
+    train_resize_only: bool = False
+    val_on_train: bool = False
 
-    # Load the dataset
-    train_dataset_raw = load_dataset(
-        "scene_parse_150",
-        "instance_segmentation",
-        split="train",
-        trust_remote_code=True,
+
+def _iter_named_dirs(base_dir: Path, name: str, max_depth: int = 4) -> list[Path]:
+    matches = []
+    base_dir = base_dir.resolve()
+    for root, dirs, _ in os.walk(base_dir):
+        current = Path(root)
+        depth = len(current.relative_to(base_dir).parts)
+        if depth > max_depth:
+            dirs[:] = []
+            continue
+        if current.name == name:
+            matches.append(current)
+    return matches
+
+
+def _has_trainval_layout(root: Path) -> bool:
+    return (
+        (root / "images" / "training").is_dir()
+        and (root / "images" / "validation").is_dir()
+        and (root / "annotations" / "training").is_dir()
+        and (root / "annotations" / "validation").is_dir()
     )
 
-    print(f"Raw dataset size: {len(train_dataset_raw)}")
-    print(f"Raw dataset features: {train_dataset_raw.features}")
-    print(f"Sample raw data item: {train_dataset_raw[0]}")
 
-    train_dataset = HuggingFacePILImageDataset(train_dataset_raw)
+def _has_test_layout(root: Path) -> bool:
+    return _get_test_images_dir(root) is not None
 
-    print(f"\nTransformed dataset size: {len(train_dataset)}")
-    sample_image, sample_mask = train_dataset[0]
-    print(f"Sample image shape: {sample_image.shape}")
-    print(f"Sample mask shape: {sample_mask.shape}")
-    print(f"Image value range: ({sample_image.min():.2f}, {sample_image.max():.2f})")
-    print(f"Unique mask values: {torch.unique(sample_mask)}")
 
-    batch_size = 4
-    train_dataloader = torch.utils.data.DataLoader(train_dataset, batch_size=batch_size)
-    print(f"\nNumber of batches in dataloader: {len(train_dataloader)}")
+def _get_test_images_dir(root: Path) -> Optional[Path]:
+    images_dir = root / "images"
+    if images_dir.is_dir():
+        return images_dir
+    testing_dir = root / "testing"
+    if testing_dir.is_dir():
+        return testing_dir
+    return None
 
-    num_samples = 3
-    for i, (image, mask) in enumerate(train_dataloader):
-        image = image.to(device)
-        mask = mask.to(device)
 
-        # Move tensors back to CPU before passing to create_segmentation_image
-        seg_img, mask_overlay = create_segmentation_image(image.cpu(), mask.cpu(), 0.5)
+def discover_ade20k_trainval_root(data_root: str | Path) -> Path:
+    base = Path(data_root)
+    candidates = [base, base / "ADEChallengeData2016"]
+    candidates.extend(_iter_named_dirs(base, "ADEChallengeData2016"))
+    for candidate in candidates:
+        if candidate.is_dir() and _has_trainval_layout(candidate):
+            return candidate
+    raise FileNotFoundError(
+        "Could not find ADE20K train/val layout. Expected images/training, images/validation, "
+        "annotations/training, annotations/validation under an ADEChallengeData2016 directory."
+    )
 
-        for j in range(seg_img.shape[0]):
-            output_filename = f"sample_img_{i*batch_size+j+1}.png"
-            cv2.imwrite(output_filename, cv2.cvtColor(seg_img[j], cv2.COLOR_RGB2BGR))
-            print(f"  Saved {output_filename}")
 
-        if i == num_samples - 1:
-            break
+def discover_ade20k_test_root(data_root: str | Path) -> Path:
+    base = Path(data_root)
+    candidates = [base, base / "release_test"]
+    candidates.extend(_iter_named_dirs(base, "release_test"))
+    for candidate in candidates:
+        if candidate.is_dir() and _has_test_layout(candidate):
+            return candidate
+    raise FileNotFoundError(
+        "Could not find ADE20K test layout. Expected release_test/images or release_test/testing "
+        "under the data root."
+    )
 
-    print("\nImage generation and dataset analysis complete.")
+
+def _list_image_files(directory: Path) -> list[Path]:
+    exts = {".jpg", ".jpeg", ".png"}
+    return sorted([p for p in directory.iterdir() if p.suffix.lower() in exts])
+
+
+def _build_image_mask_pairs(image_dir: Path, mask_dir: Path) -> tuple[list[Path], list[Path]]:
+    image_paths = _list_image_files(image_dir)
+    mask_paths = []
+    missing = []
+    for image_path in image_paths:
+        mask_path = mask_dir / f"{image_path.stem}.png"
+        if not mask_path.exists():
+            missing.append(mask_path.name)
+        mask_paths.append(mask_path)
+    if missing:
+        raise FileNotFoundError(
+            f"Missing {len(missing)} mask files in {mask_dir}. Example: {missing[0]}"
+        )
+    return image_paths, mask_paths
+
+
+class ADE20KLocalDataset(Dataset):
+    def __init__(
+        self,
+        image_paths: list[Path],
+        mask_paths: Optional[list[Path]],
+        config: ADE20KDataConfig,
+        is_train: bool,
+        return_filename: bool = False,
+    ):
+        super().__init__()
+        self.image_paths = image_paths
+        self.mask_paths = mask_paths
+        self.config = config
+        self.is_train = is_train
+        self.return_filename = return_filename
+        self.normalize = transforms.Normalize(
+            mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)
+        )
+
+    def __len__(self) -> int:
+        return len(self.image_paths)
+
+    def _resize(
+        self, image: Image.Image, mask: Optional[Image.Image]
+    ) -> tuple[Image.Image, Optional[Image.Image]]:
+        size = (self.config.image_size, self.config.image_size)
+        image = TF.resize(image, size=size, interpolation=Image.BILINEAR)
+        if mask is not None:
+            mask = TF.resize(mask, size=size, interpolation=Image.NEAREST)
+        return image, mask
+
+    def _random_scale_and_crop(
+        self, image: Image.Image, mask: Optional[Image.Image]
+    ) -> tuple[Image.Image, Optional[Image.Image]]:
+        scale = random.uniform(self.config.min_scale, self.config.max_scale)
+        new_h = max(1, int(image.height * scale))
+        new_w = max(1, int(image.width * scale))
+        image = TF.resize(image, size=(new_h, new_w), interpolation=Image.BILINEAR)
+        if mask is not None:
+            mask = TF.resize(mask, size=(new_h, new_w), interpolation=Image.NEAREST)
+
+        target_h = self.config.image_size
+        target_w = self.config.image_size
+        pad_h = max(0, target_h - new_h)
+        pad_w = max(0, target_w - new_w)
+        if pad_h > 0 or pad_w > 0:
+            image = TF.pad(image, padding=(0, 0, pad_w, pad_h), fill=0)
+            if mask is not None:
+                mask = TF.pad(mask, padding=(0, 0, pad_w, pad_h), fill=0)
+
+        i, j, h, w = transforms.RandomCrop.get_params(
+            image, output_size=(target_h, target_w)
+        )
+        image = TF.crop(image, i, j, h, w)
+        if mask is not None:
+            mask = TF.crop(mask, i, j, h, w)
+        return image, mask
+
+    def _maybe_hflip(
+        self, image: Image.Image, mask: Optional[Image.Image]
+    ) -> tuple[Image.Image, Optional[Image.Image]]:
+        if random.random() < self.config.hflip_prob:
+            image = TF.hflip(image)
+            if mask is not None:
+                mask = TF.hflip(mask)
+        return image, mask
+
+    def __getitem__(self, index: int):
+        image_path = self.image_paths[index]
+        image = Image.open(image_path).convert("RGB")
+        mask = None
+        if self.mask_paths is not None:
+            mask = Image.open(self.mask_paths[index])
+
+        if self.is_train and not self.config.train_resize_only:
+            image, mask = self._random_scale_and_crop(image, mask)
+            image, mask = self._maybe_hflip(image, mask)
+        else:
+            image, mask = self._resize(image, mask)
+
+        image_tensor = TF.pil_to_tensor(image).float() / 255.0
+        image_tensor = self.normalize(image_tensor)
+
+        if mask is None:
+            if self.return_filename:
+                return image_tensor, image_path.name
+            return image_tensor
+
+        mask_tensor = TF.pil_to_tensor(mask)
+        mask_tensor = map_ade20k_labels(mask_tensor, ignore_index=self.config.ignore_index)
+        return image_tensor, mask_tensor
+
+
+class ADE20KDataset(Dataset):
+    def __init__(self, dataset, config: ADE20KDataConfig, is_train: bool):
+        super().__init__()
+        self.dataset = dataset
+        self.config = config
+        self.is_train = is_train
+        self.normalize = transforms.Normalize(
+            mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)
+        )
+
+    def __len__(self) -> int:
+        return len(self.dataset)
+
+    def _resize(self, image: Image.Image, mask: Image.Image) -> tuple[Image.Image, Image.Image]:
+        size = (self.config.image_size, self.config.image_size)
+        image = TF.resize(image, size=size, interpolation=Image.BILINEAR)
+        mask = TF.resize(mask, size=size, interpolation=Image.NEAREST)
+        return image, mask
+
+    def _random_scale_and_crop(
+        self, image: Image.Image, mask: Image.Image
+    ) -> tuple[Image.Image, Image.Image]:
+        scale = random.uniform(self.config.min_scale, self.config.max_scale)
+        new_h = max(1, int(image.height * scale))
+        new_w = max(1, int(image.width * scale))
+        image = TF.resize(image, size=(new_h, new_w), interpolation=Image.BILINEAR)
+        mask = TF.resize(mask, size=(new_h, new_w), interpolation=Image.NEAREST)
+
+        target_h = self.config.image_size
+        target_w = self.config.image_size
+        pad_h = max(0, target_h - new_h)
+        pad_w = max(0, target_w - new_w)
+        if pad_h > 0 or pad_w > 0:
+            image = TF.pad(image, padding=(0, 0, pad_w, pad_h), fill=0)
+            mask = TF.pad(mask, padding=(0, 0, pad_w, pad_h), fill=0)
+
+        i, j, h, w = transforms.RandomCrop.get_params(
+            image, output_size=(target_h, target_w)
+        )
+        image = TF.crop(image, i, j, h, w)
+        mask = TF.crop(mask, i, j, h, w)
+        return image, mask
+
+    def _maybe_hflip(
+        self, image: Image.Image, mask: Image.Image
+    ) -> tuple[Image.Image, Image.Image]:
+        if random.random() < self.config.hflip_prob:
+            image = TF.hflip(image)
+            mask = TF.hflip(mask)
+        return image, mask
+
+    def __getitem__(self, index: int) -> tuple[torch.Tensor, torch.Tensor]:
+        item = self.dataset[index]
+        image = item["image"].convert("RGB")
+        mask = item["annotation"]
+
+        if self.is_train and not self.config.train_resize_only:
+            image, mask = self._random_scale_and_crop(image, mask)
+            image, mask = self._maybe_hflip(image, mask)
+        else:
+            image, mask = self._resize(image, mask)
+
+        image = TF.pil_to_tensor(image).float() / 255.0
+        image = self.normalize(image)
+        mask = TF.pil_to_tensor(mask)
+        mask = map_ade20k_labels(mask, ignore_index=self.config.ignore_index)
+        return image, mask
+
+
+class ADE20KDataModule(pl.LightningDataModule):
+    def __init__(self, config: ADE20KDataConfig):
+        super().__init__()
+        self.config = config
+        self.train_dataset = None
+        self.val_dataset = None
+        self.test_dataset = None
+
+    def setup(self, stage: Optional[str] = None) -> None:
+        if self.config.data_root:
+            trainval_root = discover_ade20k_trainval_root(self.config.data_root)
+            train_images = trainval_root / "images" / "training"
+            train_masks = trainval_root / "annotations" / "training"
+            val_images = trainval_root / "images" / "validation"
+            val_masks = trainval_root / "annotations" / "validation"
+
+            train_image_paths, train_mask_paths = _build_image_mask_pairs(
+                train_images, train_masks
+            )
+            val_image_paths, val_mask_paths = _build_image_mask_pairs(val_images, val_masks)
+
+            if self.config.train_subset:
+                train_image_paths = train_image_paths[: self.config.train_subset]
+                train_mask_paths = train_mask_paths[: self.config.train_subset]
+            if self.config.val_subset:
+                val_image_paths = val_image_paths[: self.config.val_subset]
+                val_mask_paths = val_mask_paths[: self.config.val_subset]
+
+            self.train_dataset = ADE20KLocalDataset(
+                train_image_paths, train_mask_paths, self.config, is_train=True
+            )
+            self.val_dataset = ADE20KLocalDataset(
+                val_image_paths, val_mask_paths, self.config, is_train=False
+            )
+            if self.config.val_on_train:
+                self.val_dataset = self.train_dataset
+
+            try:
+                test_root = discover_ade20k_test_root(self.config.data_root)
+                test_images = _get_test_images_dir(test_root)
+                if test_images is None:
+                    raise FileNotFoundError(
+                        "Could not find ADE20K test images. Expected release_test/images or "
+                        "release_test/testing."
+                    )
+                test_image_paths = _list_image_files(test_images)
+                if self.config.test_subset:
+                    test_image_paths = test_image_paths[: self.config.test_subset]
+                self.test_dataset = ADE20KLocalDataset(
+                    test_image_paths,
+                    mask_paths=None,
+                    config=self.config,
+                    is_train=False,
+                    return_filename=True,
+                )
+            except FileNotFoundError:
+                self.test_dataset = None
+        else:
+            train = load_dataset(
+                "scene_parse_150",
+                split="train",
+                cache_dir=self.config.cache_dir,
+                trust_remote_code=self.config.trust_remote_code,
+            )
+            val = load_dataset(
+                "scene_parse_150",
+                split="validation",
+                cache_dir=self.config.cache_dir,
+                trust_remote_code=self.config.trust_remote_code,
+            )
+
+            if self.config.train_subset:
+                train = train.select(range(self.config.train_subset))
+            if self.config.val_subset:
+                val = val.select(range(self.config.val_subset))
+
+            self.train_dataset = ADE20KDataset(train, self.config, is_train=True)
+            self.val_dataset = ADE20KDataset(val, self.config, is_train=False)
+            if self.config.val_on_train:
+                self.val_dataset = self.train_dataset
+
+    def train_dataloader(self) -> DataLoader:
+        return DataLoader(
+            self.train_dataset,
+            batch_size=self.config.train_batch_size,
+            shuffle=True,
+            num_workers=self.config.num_workers,
+            pin_memory=True,
+            persistent_workers=self.config.num_workers > 0,
+        )
+
+    def val_dataloader(self) -> DataLoader:
+        return DataLoader(
+            self.val_dataset,
+            batch_size=self.config.val_batch_size,
+            shuffle=False,
+            num_workers=self.config.num_workers,
+            pin_memory=True,
+            persistent_workers=self.config.num_workers > 0,
+        )
+
+    def test_dataloader(self) -> DataLoader:
+        if self.test_dataset is None:
+            raise ValueError(
+                "Test split not found. Set --data-root to a directory containing release_test."
+            )
+        return DataLoader(
+            self.test_dataset,
+            batch_size=self.config.val_batch_size,
+            shuffle=False,
+            num_workers=self.config.num_workers,
+            pin_memory=True,
+            persistent_workers=self.config.num_workers > 0,
+        )

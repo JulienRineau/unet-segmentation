@@ -3,5 +3,9 @@
 *.jpeg
 *.ckpt
 *.ipynb
+debug_panels/
+debug_panels_val/
+overlays/
+wandb_graph/
 wandb
 __pycache__
